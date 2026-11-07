@@ -1,0 +1,7 @@
+# NUNCA subir credenciales ni capturas personales a Git
+config_salud.json
+config_correo.json
+.env
+*.png
+__pycache__/
+*.pyc
