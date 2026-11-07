@@ -1,0 +1,50 @@
+name: Monitor Cita Dra. Yuliet Cárdenas (Salud Colsubsidio)
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  verificar-y-agendar:
+    runs-on: ubuntu-latest
+    env:
+      TZ: America/Bogota
+    steps:
+      - name: Descargar repositorio privado
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias y navegador Chromium
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: Verificar disponibilidad y agendar con Dra. Yuliet Cárdenas
+        env:
+          COLSUBSIDIO_USER: ${{ secrets.COLSUBSIDIO_USER }}
+          COLSUBSIDIO_PASS: ${{ secrets.COLSUBSIDIO_PASS }}
+          AUTO_BOOK: "true"
+          WINDOWS_POPUP: "false"
+          SMTP_SENDER: ${{ secrets.SMTP_SENDER }}
+          SMTP_APP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
+          SMTP_RECIPIENT: ${{ secrets.SMTP_RECIPIENT }}
+        run: python verificar_cita_colsubsidio.py
+
+      - name: Guardar estado de cita agendada y reporte
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          touch estado_cita.json reporte_cita_colsubsidio.md
+          git add estado_cita.json reporte_cita_colsubsidio.md
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: actualizar estado de cita Salud Colsubsidio ($(date +'%Y-%m-%d %H:%M'))"
+            git push
+          fi
