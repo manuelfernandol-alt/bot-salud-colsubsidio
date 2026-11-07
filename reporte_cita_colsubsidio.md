@@ -1,6 +1,6 @@
 # 🩺 Monitor Cita Medicina Familiar — Salud Colsubsidio
 
-- **Última verificación:** 2026-11-06 11:57:40 PM (Hora Colombia)
+- **Última verificación:** 2026-11-07 01:10:48 AM (Hora Colombia)
 - **Profesional buscada:** Dra. Yuliet Cárdenas
 - **Sección:** Órdenes Pendientes → Medicina familiar
 - **Estado actual:** ⏳ Sin agenda habilitada todavía (0 cupos abiertos en Medicina Familiar)
