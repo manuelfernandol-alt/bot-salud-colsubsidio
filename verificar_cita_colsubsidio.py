@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -32,6 +33,25 @@ def now_bogota() -> datetime:
     return datetime.now(BOGOTA_TZ)
 
 
+def mask_id(val: str) -> str:
+    """Oculta números sensibles en logs y reportes públicos (ej. ***4681)."""
+    s = str(val or "").strip()
+    if len(s) <= 4:
+        return "***"
+    return f"***{s[-4:]}"
+
+
+def format_12h(hora_raw: str) -> tuple[str, str]:
+    hh_mm = (hora_raw or "08:00")[:5]
+    try:
+        hh_int, mm_int = [int(x) for x in hh_mm.split(":")]
+        ampm = "pm" if hh_int >= 12 else "am"
+        hh_12 = hh_int % 12 or 12
+        return hh_mm, f"{hh_12}:{mm_int:02d} {ampm}"
+    except Exception:
+        return hh_mm, hh_mm
+
+
 def normalize_text(text: str) -> str:
     if not text:
         return ""
@@ -43,12 +63,12 @@ def normalize_text(text: str) -> str:
 def matches_yuliet_cardenas(doctor_name: str) -> bool:
     """
     Verifica estrictamente si el nombre del profesional corresponde a la Dra. Yuliet Cárdenas
-    (soportando variantes ortográficas comunes como Yuliet/Yulieth/Juliet/Julieth y orden Apellidos-Nombres).
+    (soportando variantes Yuliet/Yulieth/Juliet/Julieth/Julie y orden Apellidos-Nombres).
     """
     norm = normalize_text(doctor_name)
     if not norm or "medicodisponible" in norm.replace(" ", ""):
         return False
-    has_first = any(v in norm for v in ("yuliet", "yulieth", "juliet", "julieth", "yulie"))
+    has_first = any(v in norm for v in ("yuliet", "yulieth", "juliet", "julieth", "yulie", "julie"))
     has_last = "cardenas" in norm
     return has_first and has_last
 
@@ -61,7 +81,7 @@ def load_config() -> dict:
                 with open(candidate, "r", encoding="utf-8") as f:
                     cfg.update(json.load(f))
             except Exception as e:
-                print(f"[WARN] No se pudo leer {os.path.basename(candidate)}: {e}")
+                print(f"[WARN] No se pudo leer configuración local ({os.path.basename(candidate)}): {e}")
 
     return {
         "doc_type_option": os.environ.get("COLSUBSIDIO_DOC_OPTION") or cfg.get("doc_type_option", "0: 2"),
@@ -87,7 +107,7 @@ def load_state() -> dict:
                 return json.load(f)
         except Exception:
             pass
-    return {}
+    return {"booked": False, "notified_other_hashes": []}
 
 
 def save_state(state: dict) -> None:
@@ -98,14 +118,14 @@ def save_state(state: dict) -> None:
 def write_report(status_title: str, details_lines: list[str]) -> str:
     ts = now_bogota().strftime("%Y-%m-%d %I:%M:%S %p (Hora Colombia)")
     md = [
-        f"# 🩺 Monitor Cita Medicina Familiar — Salud Colsubsidio",
-        f"",
+        "# 🩺 Monitor Cita Medicina Familiar — Salud Colsubsidio",
+        "",
         f"- **Última verificación:** {ts}",
-        f"- **Profesional buscada:** Dra. Yuliet Cárdenas",
-        f"- **Sección:** Órdenes Pendientes → Medicina familiar",
+        "- **Agendamiento automático exclusivo con:** Dra. Yuliet Cárdenas",
+        "- **Otros médicos:** Solo aviso informativo (sin agendar)",
         f"- **Estado actual:** {status_title}",
-        f"",
-        f"## Detalle de la revisión",
+        "",
+        "## Detalle de la revisión",
     ]
     for line in details_lines:
         md.append(f"- {line}")
@@ -115,18 +135,23 @@ def write_report(status_title: str, details_lines: list[str]) -> str:
     return content
 
 
-def trigger_windows_alert(title: str, message: str) -> None:
+def trigger_windows_alert(title: str, message: str, urgent: bool = True) -> None:
     """Muestra alerta emergente con sonido en Windows sin bloquear el proceso principal."""
     if sys.platform != "win32" or os.environ.get("GITHUB_ACTIONS") == "true":
         return
     try:
         safe_title = title.replace("'", "''").replace('"', "`\"")
         safe_msg = message.replace("'", "''").replace('"', "`\"")
+        beep_seq = (
+            "[console]::beep(880,300); [console]::beep(1175,450); "
+            if urgent
+            else "[console]::beep(660,250); "
+        )
         ps_script = (
             "Add-Type -AssemblyName PresentationFramework,System.Windows.Forms; "
-            "[System.Media.SystemSounds]::Exclamation.Play(); Start-Sleep -Milliseconds 450; "
-            "[console]::beep(880,300); [console]::beep(1175,450); "
-            f"[System.Windows.Forms.MessageBox]::Show('{safe_msg}', '{safe_title}', "
+            "[System.Media.SystemSounds]::Exclamation.Play(); Start-Sleep -Milliseconds 350; "
+            + beep_seq
+            + f"[System.Windows.Forms.MessageBox]::Show('{safe_msg}', '{safe_title}', "
             "'OK', 'Information', 'Button1', 'ServiceNotification') | Out-Null"
         )
         creation_flags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008) | getattr(
@@ -149,7 +174,7 @@ def send_email_notification(cfg: dict, subject: str, html_body: str, screenshot_
     raw_recipients = cfg.get("smtp_recipient", "") or sender
     recipients = [r.strip() for r in raw_recipients.split(",") if r.strip()]
     if not (sender and password and recipients):
-        return False, "Faltan credenciales SMTP para enviar confirmación por correo."
+        return False, "Faltan credenciales SMTP."
 
     try:
         msg = MIMEMultipart("mixed")
@@ -181,7 +206,7 @@ def send_email_notification(cfg: dict, subject: str, html_body: str, screenshot_
                 server.ehlo()
                 server.login(sender, password)
                 server.sendmail(sender, recipients, msg.as_string())
-        return True, f"Correo enviado exitosamente a {', '.join(recipients)}."
+        return True, f"Notificación enviada por correo ({len(recipients)} destinatario(s))."
     except Exception as e:
         return False, f"Error enviando correo: {e}"
 
@@ -199,18 +224,17 @@ async def launch_browser(p):
 
 async def attempt_ui_booking(page, winning_slot: dict) -> tuple[bool, str]:
     """
-    Intenta agendar la cita directamente sobre el formulario Angular (#/agendarcitag/...)
-    verificando estrictamente que el especialista seleccionado sea la Dra. Yuliet Cárdenas.
+    Agenda la cita en el formulario Angular (#/agendarcitag/...) verificando estrictamente
+    que el especialista seleccionado sea la Dra. Yuliet Cárdenas.
     """
     try:
         city_name = winning_slot["city_name"]
         ips_name = winning_slot["ips_name"]
-        jornada = winning_slot["jornada"]  # 'M' o 'T'
-        fecha_str = winning_slot["fecha"]  # 'YYYY-MM-DD'
-        hora_ap = winning_slot["hora_ap"]  # ej. '8:00 am'
-        hora_24 = winning_slot["hora_24"]  # ej. '08:00'
+        jornada = winning_slot["jornada"]
+        fecha_str = winning_slot["fecha"]
+        hora_ap = winning_slot["hora_ap"]
+        hora_24 = winning_slot["hora_24"]
 
-        # 1. Seleccionar ciudad en el primer ng-select
         city_selects = page.locator("app-user-data-appointments ng-select")
         if await city_selects.count() > 0:
             await city_selects.first.click()
@@ -222,7 +246,6 @@ async def attempt_ui_booking(page, winning_slot: dict) -> tuple[bool, str]:
                 await page.locator(".ng-option").first.click()
             await page.wait_for_timeout(2500)
 
-        # 2. Si aparece opción de búsqueda "Por centro médico", seleccionarla
         por_centro = page.locator("text=/centro m[ée]dico/i")
         for i in range(await por_centro.count()):
             if await por_centro.nth(i).is_visible():
@@ -235,7 +258,6 @@ async def attempt_ui_booking(page, winning_slot: dict) -> tuple[bool, str]:
                     except Exception:
                         pass
 
-        # 3. Seleccionar Centro Médico si el selector está habilitado y vacío
         mc_input = page.locator("#medical-center")
         if await mc_input.count() > 0 and await mc_input.first.is_visible():
             mc_ng = page.locator("app-medical-center ng-select").first
@@ -246,7 +268,6 @@ async def attempt_ui_booking(page, winning_slot: dict) -> tuple[bool, str]:
                 await opt_ips.first.click()
                 await page.wait_for_timeout(2000)
 
-        # 4. Seleccionar Jornada (Mañana / Tarde)
         if jornada in ("M", "T"):
             jornada_regex = r"ma[ñn]ana" if jornada == "M" else r"tarde"
             j_loc = page.locator(f"label:has-text(/{jornada_regex}/i), input[value='{jornada}']")
@@ -256,17 +277,13 @@ async def attempt_ui_booking(page, winning_slot: dict) -> tuple[bool, str]:
                     await page.wait_for_timeout(2500)
                     break
 
-        # 5. Navegar calendario al mes/año de la fecha disponible y seleccionar el día
         y, m, d = [int(x) for x in fecha_str.split("-")]
-        target_aria_patterns = [f"{d}-{m}-{y}", f"{y}-{m:02d}-{d:02d}"]
         for _ in range(6):
-            # Buscar día habilitado en el mes visible
             clicked_day = await page.evaluate(
-                """({year, month, day}) => {
+                """({day}) => {
                     const cells = Array.from(document.querySelectorAll('.ngb-dp-day:not(.disabled):not(.hidden)'));
                     for (const cell of cells) {
                         const txt = (cell.innerText || '').trim();
-                        const aria = (cell.getAttribute('aria-label') || '');
                         if (txt === String(day) && !cell.classList.contains('text-muted')) {
                             cell.click();
                             return true;
@@ -274,7 +291,7 @@ async def attempt_ui_booking(page, winning_slot: dict) -> tuple[bool, str]:
                     }
                     return false;
                 }""",
-                {"year": y, "month": m, "day": d},
+                {"day": d},
             )
             if clicked_day:
                 break
@@ -284,7 +301,6 @@ async def attempt_ui_booking(page, winning_slot: dict) -> tuple[bool, str]:
                 await page.wait_for_timeout(800)
         await page.wait_for_timeout(2500)
 
-        # 6. Seleccionar Hora (#cita-hour)
         hour_ng = page.locator("ng-select:has(#cita-hour)")
         if await hour_ng.count() > 0:
             await hour_ng.first.click()
@@ -296,7 +312,7 @@ async def attempt_ui_booking(page, winning_slot: dict) -> tuple[bool, str]:
                 await opt_hr.first.click()
                 await page.wait_for_timeout(1500)
 
-        # 7. Seleccionar Especialista (#select-specialist) — VERIFICACIÓN ESTRICTA DRA. YULIET CÁRDENAS
+        # VERIFICACIÓN ESTRICTA: SOLO SELECCIONAR SI ES LA DRA. YULIET CÁRDENAS
         spec_ng = page.locator("ng-select:has(#select-specialist)")
         if await spec_ng.count() > 0:
             await spec_ng.first.click()
@@ -309,23 +325,20 @@ async def attempt_ui_booking(page, winning_slot: dict) -> tuple[bool, str]:
                     matched_opt_idx = idx
                     break
             if matched_opt_idx < 0:
-                return False, "No apareció la Dra. Yuliet Cárdenas en el desplegable visual de especialistas."
+                return False, "No apareció la Dra. Yuliet Cárdenas en el desplegable visual."
             await page.locator(".ng-option").nth(matched_opt_idx).click()
             await page.wait_for_timeout(1500)
 
-        # 8. Aceptar política de datos personales (mat-icon check_box_outline_blank)
         chk = page.locator("mat-icon:has-text('check_box_outline_blank')")
         if await chk.count() > 0 and await chk.first.is_visible():
             await chk.first.click()
             await page.wait_for_timeout(800)
 
-        # 9. Clic en Siguiente (#nextagenda_step1 -> Resumen de la cita)
         step1_btn = page.locator("#nextagenda_step1")
         if await step1_btn.count() > 0 and await step1_btn.first.is_enabled():
             await step1_btn.first.click()
             await page.wait_for_timeout(2500)
 
-        # 10. Clic en Siguiente/Confirmar en Resumen (#nextagenda_step4)
         step4_btn = page.locator("#nextagenda_step4")
         if await step4_btn.count() > 0 and await step4_btn.first.is_visible():
             await step4_btn.first.click()
@@ -334,9 +347,9 @@ async def attempt_ui_booking(page, winning_slot: dict) -> tuple[bool, str]:
             body_after = await page.inner_text("body")
             if re.search(r"confirmaci[óo]n|exitosa|asignada|reservada|agendada", body_after, re.I):
                 return True, "Cita agendada y confirmada exitosamente por interfaz web."
-            return True, f"Formulario de confirmación enviado ({body_after[:200].strip()})."
+            return True, "Formulario de confirmación enviado."
 
-        return False, "El botón final de confirmación (#nextagenda_step4) no estuvo habilitado en la interfaz."
+        return False, "El botón final de confirmación (#nextagenda_step4) no estuvo habilitado."
     except Exception as e:
         return False, f"Excepción en agendamiento UI: {e}"
 
@@ -349,10 +362,6 @@ async def attempt_api_booking_fallback(
     target_order: dict,
     winning_slot: dict,
 ) -> tuple[bool, str, str]:
-    """
-    Respaldo directo contra el endpoint oficial /api/conorden/v1.0/agendamiento/citas/conorden/reserva-confirmacion
-    usando exactamente la estructura de AgendarCitaGeneralComponent en caso de que algún selector visual cambie.
-    """
     raw_slot = winning_slot["raw_slot"]
     payload = {
         "reserveWithOrderRequest": {
@@ -399,21 +408,22 @@ async def attempt_api_booking_fallback(
         creacion = (data.get("creacionConOrden") or [{}])[0]
         reserva_id = ((creacion.get("cita") or {}).get("idReserva")) or ""
         if cod == "I" and reserva_id:
-            return True, str(reserva_id), f"Confirmada por API directa (ID Reserva: {reserva_id} - {desc})"
+            return True, str(reserva_id), f"Confirmada por API directa ({desc})"
         return False, "", f"Respuesta API ({res.get('status')}): código={cod}, {desc}"
     except Exception:
-        return False, "", f"Respuesta API ({res.get('status')}): {(res.get('text') or '')[:200]}"
+        return False, "", f"Respuesta API ({res.get('status')})"
 
 
 async def run_check():
     cfg = load_config()
     if not (cfg["username"] and cfg["password"]):
-        msg = "Faltan credenciales COLSUBSIDIO_USER / COLSUBSIDIO_PASS (configúralas en config_salud.json o en GitHub Secrets)."
+        msg = "Faltan credenciales COLSUBSIDIO_USER / COLSUBSIDIO_PASS."
         print(f"[ERROR] {msg}")
         write_report("❌ Error de configuración", [msg])
         sys.exit(1)
 
     state = load_state()
+    notified_hashes = set(state.get("notified_other_hashes") or [])
     print(f"[{now_bogota().strftime('%Y-%m-%d %H:%M:%S')}] Iniciando verificación en Portal Salud Colsubsidio...")
 
     captured_auth_headers = {}
@@ -501,14 +511,11 @@ async def run_check():
         if not familiar_orders:
             await browser.close()
             if state.get("booked"):
-                msg = (
-                    f"La orden de Medicina Familiar ya fue agendada previamente "
-                    f"({state.get('summary', 'con la Dra. Yuliet Cárdenas')})."
-                )
+                msg = "La orden de Medicina Familiar ya fue agendada exitosamente con la Dra. Yuliet Cárdenas."
                 print(f"[OK] {msg}")
-                write_report("✅ Cita ya agendada", [msg])
+                write_report("✅ Cita ya agendada con la Dra. Yuliet Cárdenas", [msg])
                 return
-            msg = "No aparece ninguna orden pendiente de Medicina Familiar en la sección Órdenes Pendientes (puede haber sido agendada ya o vencida)."
+            msg = "No aparece ninguna orden pendiente de Medicina Familiar en Órdenes Pendientes."
             print(f"[INFO] {msg}")
             write_report("ℹ️ Sin orden pendiente de Medicina Familiar", [msg])
             return
@@ -517,13 +524,12 @@ async def run_check():
         esp_id = str(target_order.get("codigoEspecialidad", "0235"))
         prestacion_id = str(target_order.get("prestacionId", "890202232A"))
         num_orden = str(target_order.get("numeroOrden", ""))
+        masked_orden = mask_id(num_orden)
         desc_serv = str(target_order.get("descripcionPrestacion", ""))
         paciente_id = str(target_order.get("pacienteId") or captured_patient.get("id") or "")
         convenio = str(((captured_afiliacion.get("derechos") or {}).get("convenioCodigo")) or "110010817105")
 
-        print(
-            f"[OK] Orden localizada: Medicina Familiar ({esp_id}) | Orden #{num_orden} | Servicio: {desc_serv}"
-        )
+        print(f"[OK] Orden localizada: Medicina Familiar ({esp_id}) | Orden {masked_orden}")
 
         # 6. Verificar si ya existe cita agendada para esta prestación (evita doble agendamiento)
         existing_check = await page.evaluate(
@@ -542,12 +548,12 @@ async def run_check():
         )
         if int(existing_check.get("totalCountPrestacion") or 0) > 0:
             await browser.close()
-            msg = f"Ya tienes una cita activa agendada para Medicina Familiar ({desc_serv}, Orden #{num_orden}). No se realiza ningún cambio."
+            msg = f"Ya existe una cita activa agendada para Medicina Familiar (Orden {masked_orden}). No se realiza ningún cambio."
             print(f"[OK] {msg}")
             write_report("✅ Cita ya agendada en el sistema", [msg])
             return
 
-        # 7. Entrar a la pantalla de disponibilidad de la orden de Medicina Familiar
+        # 7. Entrar a la pantalla de disponibilidad de Medicina Familiar
         await page.evaluate(
             """() => {
                 const cards = Array.from(document.querySelectorAll('.card-padding'));
@@ -563,7 +569,7 @@ async def run_check():
         await page.locator("button:has-text('Agendar Cita')").first.click()
         await page.wait_for_timeout(5000)
 
-        # 8. Escanear todas las ciudades, centros médicos, jornadas, fechas y especialistas disponibles
+        # 8. Escanear todas las ciudades, sedes, jornadas, fechas y especialistas disponibles
         scan_result = await page.evaluate(
             """async ({headers, espId, prestacion, pacienteId, convenio}) => {
                 const h = {...headers, 'Cache-Control': 'no-cache', 'Pragma': 'no-cache'};
@@ -661,44 +667,109 @@ async def run_check():
         cities_count = scan_result.get("citiesCount", 0)
         centers_count = scan_result.get("centersCount", 0)
 
-        # Filtrar cupos exclusivos de la Dra. Yuliet Cárdenas
+        # Separar cupos de la Dra. Yuliet Cárdenas vs otros médicos
         yuliet_slots = [s for s in all_slots if matches_yuliet_cardenas(s.get("doctor_name", ""))]
-        other_doctors = sorted({s.get("doctor_name", "") for s in all_slots if s.get("doctor_name")})
+        other_slots = [s for s in all_slots if not matches_yuliet_cardenas(s.get("doctor_name", ""))]
 
-        if not yuliet_slots:
+        # CASO A: NO HAY NINGÚN CUPO CON NADIE
+        if not yuliet_slots and not other_slots:
             await browser.close()
-            if cities_count == 0 or len(all_slots) == 0:
-                status_msg = "⏳ Sin agenda habilitada todavía (0 cupos abiertos en Medicina Familiar)"
-                details = [
-                    f"Orden activa verificada: **#{num_orden}** (*{desc_serv}*).",
-                    "El portal responde actualmente: *\"De momento ese servicio no está disponible por este canal\"* (`obtenerIps: []`).",
-                    "Se volverá a revisar automáticamente en el siguiente ciclo.",
-                ]
-                print(f"[SIN CUPOS] Aún no hay agenda abierta para Medicina Familiar (Orden #{num_orden}).")
+            status_msg = "⏳ Sin agenda habilitada todavía (0 cupos abiertos en Medicina Familiar)"
+            details = [
+                f"Orden activa verificada: **{masked_orden}** (*Medicina Familiar*).",
+                "El portal responde actualmente: *\"De momento ese servicio no está disponible por este canal\"*.",
+                "Se volverá a revisar automáticamente en el siguiente ciclo.",
+            ]
+            print(f"[SIN CUPOS] Aún no hay agenda abierta para Medicina Familiar (Orden {masked_orden}).")
+            write_report(status_msg, details)
+            return
+
+        # CASO B: HAY CITA CON OTRO(S) MÉDICO(S), PERO NO CON YULIET CÁRDENAS -> ¡AVISAR PERO NO AGENDAR!
+        if not yuliet_slots and other_slots:
+            await browser.close()
+            other_slots.sort(key=lambda x: (x["fecha"], x["hora_raw"]))
+
+            # Agrupar por (doctor, sede, fecha) para mostrar resumen claro y evitar correos repetidos
+            grouped = {}
+            new_groups = {}
+            for s in other_slots:
+                _, h_ap = format_12h(s["hora_raw"])
+                key_tuple = (s["doctor_name"], s["ips_name"], s["fecha"])
+                grouped.setdefault(key_tuple, []).append(h_ap)
+
+                sig_raw = f"{s['doctor_name']}|{s['code_ips']}|{s['fecha']}"
+                sig_hash = hashlib.sha256(sig_raw.encode("utf-8")).hexdigest()[:16]
+                if sig_hash not in notified_hashes:
+                    notified_hashes.add(sig_hash)
+                    new_groups[key_tuple] = grouped[key_tuple]
+
+            other_doctors_names = sorted({s["doctor_name"] for s in other_slots if s.get("doctor_name")})
+            status_msg = (
+                f"🔔 Hay cupos con otro médico ({len(other_slots)} horarios), pero 0 con la Dra. Yuliet Cárdenas — NO se agendó"
+            )
+            details = [
+                f"Orden activa verificada: **{masked_orden}**.",
+                f"Centros médicos con agenda: {centers_count} | Horarios totales con otros médicos: {len(other_slots)}.",
+                f"Otros profesionales disponibles: **{', '.join(other_doctors_names[:8])}**.",
+                "**Acción tomada:** NO se agendó automáticamente (reservado exclusivamente para la Dra. Yuliet Cárdenas).",
+            ]
+
+            if new_groups:
+                # Construir listado legible para correo y alerta en Windows
+                lines_plain = []
+                rows_html = []
+                for (doc_n, ips_n, fec), hrs in list(new_groups.items())[:12]:
+                    hrs_preview = ", ".join(dict.fromkeys(hrs))[:90]
+                    lines_plain.append(f"• {doc_n} | {fec} ({hrs_preview}) | {ips_n}")
+                    rows_html.append(
+                        f"<li><b>{doc_n}</b> — Fecha: <b>{fec}</b> ({hrs_preview}) — Sede: {ips_n}</li>"
+                    )
+
+                if cfg["windows_popup"]:
+                    win_msg = (
+                        "Abrieron agenda de Medicina Familiar con OTRO médico.\n"
+                        "NO se agendó (seguimos esperando a la Dra. Yuliet Cárdenas):\n\n"
+                        + "\n".join(lines_plain[:6])
+                    )
+                    trigger_windows_alert("Aviso Medicina Familiar (Otro Médico)", win_msg, urgent=False)
+
+                subj = f"ℹ️ Cupos en Medicina Familiar con otro médico (NO agendado — esperando a Dra. Yuliet)"
+                html_other = f"""<!DOCTYPE html>
+<html lang="es">
+<body style="font-family: system-ui, sans-serif; background:#f8fafc; padding:24px;">
+  <div style="max-width:640px; margin:0 auto; background:#ffffff; border-radius:12px; border:1px solid #cbd5e1; overflow:hidden;">
+    <div style="background:#0369a1; color:#ffffff; padding:18px 20px;">
+      <h2 style="margin:0; font-size:19px;">ℹ️ Aviso: Abrieron agenda con otro profesional (NO agendado)</h2>
+    </div>
+    <div style="padding:20px; color:#1e293b; line-height:1.6;">
+      <p>Se detectaron cupos abiertos en <b>Medicina Familiar</b> (Orden #{num_orden}), pero corresponden a <b>otro(s) médico(s)</b>:</p>
+      <ul>
+        {''.join(rows_html)}
+      </ul>
+      <p style="background:#fef9c3; border-left:4px solid #ca8a04; padding:12px; border-radius:6px;">
+        🔒 <b>No se agendó ninguna cita:</b> El bot dejó tu orden intacta y sigue revisando automáticamente para agendar <b>solo con la Dra. Yuliet Cárdenas</b>. (Si en algún momento deseas tomar alguno de estos otros cupos manualmente, puedes entrar al portal).
+      </p>
+      <p style="font-size:13px; color:#64748b;">Verificado el {now_bogota().strftime('%Y-%m-%d %I:%M:%S %p')} (Hora Colombia).</p>
+    </div>
+  </div>
+</body>
+</html>"""
+                _, mail_msg = send_email_notification(cfg, subj, html_other)
+                details.append(f"Aviso de otros médicos: {mail_msg}")
+                state["notified_other_hashes"] = sorted(list(notified_hashes))[-200:]
+                save_state(state)
+                print(f"[AVISO OTROS MEDICOS] {len(new_groups)} combinaciones nuevas notificadas sin agendar. ({mail_msg})")
             else:
-                status_msg = f"⏳ Hay agenda con otros profesionales ({len(all_slots)} cupos), pero 0 con la Dra. Yuliet Cárdenas"
-                details = [
-                    f"Orden activa verificada: **#{num_orden}** (*{desc_serv}*).",
-                    f"Centros médicos con agenda: {centers_count} | Cupos totales: {len(all_slots)}.",
-                    f"Profesionales disponibles en este momento: {', '.join(other_doctors[:8]) or 'Ninguno'}.",
-                    "**No se agendó ninguna cita** porque ningún cupo corresponde a la **Dra. Yuliet Cárdenas**.",
-                ]
-                print(f"[SIN YULIET] Hay cupos con otros médicos ({other_doctors}), pero ninguno con Yuliet Cárdenas.")
+                details.append("Ya se había enviado aviso previo sobre estos mismos cupos de otros médicos (sin spam).")
+                print("[SIN YULIET] Siguen disponibles los mismos cupos con otros médicos ya notificados; esperando a Dra. Yuliet.")
 
             write_report(status_msg, details)
             return
 
-        # Ordenar cronológicamente para elegir el PRIMER cupo disponible con la Dra. Yuliet Cárdenas
+        # CASO C: ¡HAY CUPO CON LA DRA. YULIET CÁRDENAS! -> AGENDAR AUTOMÁTICAMENTE EL PRIMERO
         yuliet_slots.sort(key=lambda x: (x["fecha"], x["hora_raw"]))
         winner = yuliet_slots[0]
-
-        # Formatear hora 12h tal como lo hace Angular (ej. "8:00 am")
-        hh_mm = (winner["hora_raw"] or "08:00")[:5]
-        hh_int, mm_int = [int(x) for x in hh_mm.split(":")]
-        ampm = "pm" if hh_int >= 12 else "am"
-        hh_12 = hh_int % 12 or 12
-        winner["hora_24"] = hh_mm
-        winner["hora_ap"] = f"{hh_12}:{mm_int:02d} {ampm}"
+        winner["hora_24"], winner["hora_ap"] = format_12h(winner["hora_raw"])
 
         print(
             f"🎉 ¡CUPO ENCONTRADO CON {winner['doctor_name']}! "
@@ -710,7 +781,6 @@ async def run_check():
         reserva_id = ""
 
         if cfg["auto_book"]:
-            # Intento 1: Por interfaz Angular
             ui_ok, ui_msg = await attempt_ui_booking(page, winner)
             if captured_reserva_response:
                 cod = ((captured_reserva_response.get("resultado") or [{}])[0]).get("codigo", "")
@@ -720,7 +790,6 @@ async def run_check():
                     booked_ok = True
                     booking_note = f"Cita agendada automáticamente (Reserva #{reserva_id})."
 
-            # Intento 2: Respaldo directo API si UI no completó la reserva
             if not booked_ok:
                 api_ok, api_res_id, api_msg = await attempt_api_booking_fallback(
                     page,
@@ -744,45 +813,30 @@ async def run_check():
 
         await browser.close()
 
-        summary_str = (
-            f"Dra. {winner['doctor_name']} — {winner['fecha']} a las {winner['hora_ap']} "
-            f"en {winner['ips_name']} ({winner['city_name']})"
-        )
         if booked_ok:
-            save_state(
-                {
-                    "booked": True,
-                    "booked_at": now_bogota().isoformat(),
-                    "reserva_id": reserva_id,
-                    "orden": num_orden,
-                    "doctor": winner["doctor_name"],
-                    "fecha": winner["fecha"],
-                    "hora": winner["hora_ap"],
-                    "sede": winner["ips_name"],
-                    "direccion": winner["ips_address"],
-                    "summary": summary_str,
-                }
-            )
+            state["booked"] = True
+            state["booked_at"] = now_bogota().isoformat()
+            state["fecha"] = winner["fecha"]
+            state["hora"] = winner["hora_ap"]
+            state["sede"] = winner["ips_name"]
+            save_state(state)
 
         status_header = (
             f"✅ ¡CITA AGENDADA CON LA DRA. {winner['doctor_name']}!"
             if booked_ok
-            else f"⚠️ ¡CUPO DISPONIBLE CON LA DRA. {winner['doctor_name']}! (Ingresa ya para confirmar)"
+            else f"🚨 ¡CUPO DISPONIBLE CON LA DRA. {winner['doctor_name']}! (Ingresa ya para confirmar)"
         )
         details_report = [
             f"**Profesional:** {winner['doctor_name']}",
             f"**Fecha y hora:** {winner['fecha']} a las {winner['hora_ap']}",
-            f"**Centro Médico:** {winner['ips_name']} ({winner['ips_address'] or winner['city_name']})",
-            f"**Orden médica:** #{num_orden} (*{desc_serv}*)",
-            f"**Resultado agendamiento:** {booking_note}",
+            f"**Centro Médico:** {winner['ips_name']}",
+            f"**Orden médica:** {masked_orden}",
+            f"**Estado:** {'Agendada exitosamente' if booked_ok else 'Pendiente confirmación manual'}",
         ]
-        if reserva_id:
-            details_report.append(f"**ID de Reserva Colsubsidio:** `{reserva_id}`")
 
-        # Alerta emergente + sonido en Windows
         if cfg["windows_popup"]:
             win_title = (
-                "¡Cita Agendada - Salud Colsubsidio!"
+                "¡Cita Agendada con Dra. Yuliet Cárdenas!"
                 if booked_ok
                 else "¡Cupo Disponible con Dra. Yuliet Cárdenas!"
             )
@@ -794,9 +848,8 @@ async def run_check():
                 f"Orden: #{num_orden}\n"
                 f"Detalle: {booking_note}"
             )
-            trigger_windows_alert(win_title, win_body)
+            trigger_windows_alert(win_title, win_body, urgent=True)
 
-        # Confirmación por correo electrónico
         email_subject = (
             f"✅ Cita Agendada con Dra. {winner['doctor_name']} ({winner['fecha']} {winner['hora_ap']})"
             if booked_ok
@@ -810,8 +863,7 @@ async def run_check():
       <h2 style="margin:0; font-size:20px;">{status_header}</h2>
     </div>
     <div style="padding:20px; color:#1e293b; line-height:1.6;">
-      <p>Hola <b>Ana Flor</b>,</p>
-      <p>El monitor automático detectó disponibilidad en <b>Salud Colsubsidio (Medicina Familiar)</b>:</p>
+      <p>El monitor automático detectó disponibilidad con la <b>Dra. Yuliet Cárdenas</b> en <b>Salud Colsubsidio</b>:</p>
       <ul>
         <li><b>Doctora:</b> {winner['doctor_name']}</li>
         <li><b>Fecha:</b> {winner['fecha']}</li>
@@ -831,7 +883,7 @@ async def run_check():
             email_html,
             CONFIRM_SCREENSHOT if os.path.exists(CONFIRM_SCREENSHOT) else None,
         )
-        details_report.append(f"**Notificación por correo:** {mail_msg}")
+        details_report.append(f"**Confirmación por correo:** {mail_msg}")
         print(f"[CORREO] {mail_msg}")
 
         write_report(status_header, details_report)
