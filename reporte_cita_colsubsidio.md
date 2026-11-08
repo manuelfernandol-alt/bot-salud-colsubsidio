@@ -1,6 +1,6 @@
 # 🩺 Monitor Cita Medicina Familiar — Salud Colsubsidio
 
-- **Última verificación:** 2026-11-08 01:37:41 PM (Hora Colombia)
+- **Última verificación:** 2026-11-08 05:28:44 PM (Hora Colombia)
 - **Agendamiento automático exclusivo con:** Dra. Yuliet Cárdenas
 - **Otros médicos:** Solo aviso informativo (sin agendar)
 - **Estado actual:** ⏳ Sin agenda habilitada todavía (0 cupos abiertos en Medicina Familiar)
